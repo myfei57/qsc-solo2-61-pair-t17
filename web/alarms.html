@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alarms</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem; color: #1b1f24; }
+nav a { margin-right: 1rem; color: #0b5fff; text-decoration: none; }
+ul { line-height: 1.7; }
+</style>
+</head>
+<body>
+<nav><a href="/cabins">Cabins</a><a href="/env">Environment</a><a href="/patrols">Patrols</a><a href="/alarms">Alarms</a></nav>
+<h1>Alarms</h1>
+<p id="summary"></p>
+<h2>Fire linkage</h2>
+<ul id="fire"></ul>
+<h2>Environment</h2>
+<ul id="env"></ul>
+<script>
+async function load() {
+  const fire = await (await fetch("/api/fire/report")).json();
+  document.getElementById("summary").textContent =
+    `Detectors ${fire.detector_count}, zones ${fire.zone_count}, alarms ${fire.alarm_count}`;
+  document.getElementById("fire").innerHTML =
+    fire.alarms.map((key) => `<li>${key}</li>`).join("");
+  const environment = await (await fetch("/api/env")).json();
+  document.getElementById("env").innerHTML =
+    environment.alarms.map((alarm) => `<li>${alarm.sensor_id}: ${alarm.value}</li>`).join("");
+}
+load();
+</script>
+</body>
+</html>
