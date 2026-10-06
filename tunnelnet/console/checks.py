@@ -35,13 +35,16 @@ def run_checks(rt: "Runtime") -> list[dict[str, str]]:
         {"name": "drain", "status": "warn" if high else "ok", "detail": f"high pits={high}"}
     )
 
-    checks.append(
-        {
-            "name": "ventilation",
-            "status": "ok" if rt.ventilation.running() else "warn",
-            "detail": rt.ventilation.status(),
-        }
-    )
+    if rt.ventilation.safe_latched():
+        vent_status = "critical"
+        vent_detail = f"safe latch: {rt.ventilation.state().reason}"
+    elif rt.ventilation.running():
+        vent_status = "ok"
+        vent_detail = f"running on {rt.ventilation.active_role()}"
+    else:
+        vent_status = "warn"
+        vent_detail = rt.ventilation.status()
+    checks.append({"name": "ventilation", "status": vent_status, "detail": vent_detail})
 
     alarms = rt.fire.alarm_count()
     checks.append(

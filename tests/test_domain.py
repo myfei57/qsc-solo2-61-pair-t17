@@ -89,7 +89,16 @@ from tunnelnet.store import (
     summarize as summarize_store,
 )
 from tunnelnet.store import record as record_module
-from tunnelnet.vent import VentService
+from tunnelnet.vent import (
+    PRIMARY,
+    STANDBY,
+    MODE_RUNNING,
+    MODE_SAFE,
+    MODE_STOPPED,
+    Hardware,
+    VentJournal,
+    VentService,
+)
 
 
 class StoreCase(unittest.TestCase):
@@ -446,13 +455,196 @@ class VentCase(unittest.TestCase):
     def test_toggle_and_status(self) -> None:
         vent = VentService()
         self.assertTrue(vent.running())
-        self.assertEqual(vent.status(), "running")
+        self.assertEqual(vent.status(), MODE_RUNNING)
+        self.assertEqual(vent.active_role(), PRIMARY)
         self.assertFalse(vent.stop())
-        self.assertEqual(vent.status(), "stopped")
+        self.assertEqual(vent.status(), MODE_STOPPED)
         self.assertTrue(vent.toggle())
         self.assertTrue(vent.start())
-        self.assertEqual(vent.state().as_dict(), {"running": True, "status": "running"})
+        projection = vent.state().as_dict()
+        self.assertTrue(projection["running"])
+        self.assertEqual(projection["status"], MODE_RUNNING)
+        self.assertEqual(projection["active_role"], PRIMARY)
+        self.assertEqual(projection["mode"], MODE_RUNNING)
+        self.assertIn("fans", projection)
         self.assertIn("ventilation", vent.describe())
+
+
+class VentFailoverCase(unittest.TestCase):
+    def _service(self, hardware=None, store=None):
+        journal = VentJournal(store) if store is not None else VentJournal.memory()
+        return VentService(hardware, journal)
+
+    def test_startup_runs_primary_behind_open_damper(self) -> None:
+        hardware = Hardware()
+        vent = self._service(hardware)
+        self.assertTrue(vent.running())
+        self.assertEqual(vent.active_role(), PRIMARY)
+        self.assertTrue(hardware.fan(PRIMARY).running())
+        self.assertTrue(hardware.damper(PRIMARY).is_open())
+        self.assertFalse(hardware.fan(STANDBY).running())
+        self.assertFalse(hardware.damper(STANDBY).is_open())
+
+    def test_active_fan_fault_switches_to_standby_break_before_make(self) -> None:
+        hardware = Hardware()
+        vent = self._service(hardware)
+        order: list[str] = []
+        original_primary_stop = hardware.fan(PRIMARY).stop
+        original_standby_start = hardware.fan(STANDBY).start
+
+        def stop_primary():
+            order.append("primary-stop")
+            return original_primary_stop()
+
+        def start_standby():
+            order.append("standby-start")
+            return original_standby_start()
+
+        hardware.fan(PRIMARY).stop = stop_primary  # type: ignore[method-assign]
+        hardware.fan(STANDBY).start = start_standby  # type: ignore[method-assign]
+
+        result = vent.report_fault(PRIMARY)
+        self.assertTrue(result.switched)
+        self.assertEqual(result.active_role, STANDBY)
+        self.assertEqual(vent.active_role(), STANDBY)
+        self.assertTrue(vent.running())
+        # break-before-make: primary fully down before standby comes up
+        self.assertEqual(order, ["primary-stop", "standby-start"])
+        self.assertFalse(hardware.damper(PRIMARY).is_open())
+        self.assertTrue(hardware.damper(STANDBY).is_open())
+        self.assertEqual(vent.switch_count(), 1)
+
+    def test_repeated_fault_is_idempotent_and_recovery_is_non_revertive(self) -> None:
+        vent = self._service()
+        vent.report_fault(PRIMARY)
+        self.assertEqual(vent.active_role(), STANDBY)
+        # flapping primary contact must not produce more switchovers
+        for _ in range(5):
+            vent.report_fault(PRIMARY)
+            vent.report_healthy(PRIMARY)
+        self.assertEqual(vent.switch_count(), 1)
+        self.assertEqual(vent.active_role(), STANDBY)
+        self.assertTrue(vent.running())
+        # only an explicit operator restore moves back
+        self.assertFalse(vent.restore_primary().switched is None)
+        self.assertEqual(vent.active_role(), PRIMARY)
+
+    def test_duplicate_request_id_runs_switch_once(self) -> None:
+        hardware = Hardware()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(tmp)
+            vent = self._service(hardware, store)
+            first = vent.switch_over(STANDBY, request_id="switch-1")
+            standby_starts = hardware.fan(STANDBY).starts()
+            duplicate = vent.switch_over(STANDBY, request_id="switch-1")
+            self.assertTrue(first.switched)
+            self.assertFalse(duplicate.switched)
+            self.assertEqual(duplicate.reason, "duplicate request ignored")
+            self.assertEqual(hardware.fan(STANDBY).starts(), standby_starts)
+            # idempotency survives a process restart from the same store
+            restarted = self._service(Hardware(), store)
+            again = restarted.switch_over(STANDBY, request_id="switch-1")
+            self.assertFalse(again.switched)
+
+    def test_state_is_rehydrated_from_disk_on_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(tmp)
+            vent = self._service(None, store)
+            vent.report_fault(PRIMARY)
+            vent.stop()
+            restarted = self._service(None, store)
+            self.assertEqual(restarted.mode(), MODE_STOPPED)
+            self.assertEqual(restarted.active_role(), "")
+            self.assertEqual(restarted.switch_count(), 1)
+            restarted.start()
+            self.assertTrue(restarted.running())
+
+    def test_standby_start_failure_settles_safe(self) -> None:
+        hardware = Hardware()
+        vent = self._service(hardware)
+        hardware.fan(STANDBY).set_fault(True)
+        result = vent.report_fault(PRIMARY)
+        self.assertFalse(result.switched)
+        self.assertEqual(result.mode, MODE_SAFE)
+        self.assertTrue(vent.safe_latched())
+        self.assertTrue(hardware.is_safe())
+        # a latched bank refuses ordinary start/switch commands
+        self.assertFalse(vent.start())
+        self.assertEqual(vent.switch_over(STANDBY).reason, "bank latched safe; reset required")
+
+    def test_damper_open_failure_rolls_back_and_latches_safe(self) -> None:
+        hardware = Hardware()
+        vent = self._service(hardware)
+        hardware.damper(STANDBY).set_fault(True)  # never reaches the open limit switch
+        result = vent.switch_over(STANDBY, request_id="bad-damper")
+        self.assertEqual(result.mode, MODE_SAFE)
+        self.assertTrue(vent.safe_latched())
+        # no fan runs, no damper left open
+        self.assertTrue(hardware.is_safe())
+        events = [entry.event for entry in vent.events()]
+        self.assertIn("vent_switch_failed", events)
+        self.assertIn("vent_switch_rolled_back", events)
+        self.assertIn("vent_safe", events)
+        # after the field device is repaired the operator clears the latch
+        hardware.damper(STANDBY).set_fault(False)
+        reset = vent.reset_safe()
+        self.assertTrue(reset.switched)
+        self.assertTrue(vent.running())
+
+    def test_both_fans_faulted_goes_straight_safe(self) -> None:
+        hardware = Hardware()
+        vent = self._service(hardware)
+        hardware.fan(STANDBY).set_fault(True)
+        hardware.fan(PRIMARY).set_fault(True)
+        result = vent.report_fault(PRIMARY)
+        self.assertEqual(result.mode, MODE_SAFE)
+        self.assertIn("no healthy fan", result.reason)
+
+    def test_fire_stop_closes_every_path(self) -> None:
+        vent = self._service()
+        vent.report_fault(PRIMARY)  # now running on standby
+        self.assertFalse(vent.stop())
+        self.assertEqual(vent.mode(), MODE_STOPPED)
+        state = vent.state()
+        self.assertFalse(state.dampers[0].open)
+        self.assertFalse(state.dampers[1].open)
+        self.assertFalse(state.primary.running)
+        self.assertFalse(state.standby.running)
+
+    def test_status_and_audit_read_the_same_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(tmp)
+            vent = self._service(None, store)
+            vent.report_fault(PRIMARY)
+            # the audit projection contains the same transition the status shows
+            events = [entry.event for entry in vent.events()]
+            self.assertEqual(events.count("vent_switched"), 1)
+            self.assertTrue(any(entry.request_id for entry in vent.events()))
+            # a second service over the same store reads exactly those records
+            twin = self._service(None, store)
+            twin_events = [entry.event for entry in twin.events()]
+            self.assertEqual([event for event in twin_events if event != "vent_restored"], events)
+            self.assertEqual(twin_events.count("vent_restored"), 1)
+            self.assertEqual(twin.switch_count(), 1)
+
+    def test_restore_primary_refused_while_still_faulted(self) -> None:
+        hardware = Hardware()
+        vent = self._service(hardware)
+        vent.report_fault(PRIMARY)
+        result = vent.restore_primary()
+        self.assertFalse(result.switched)
+        self.assertIn("still faulted", result.reason)
+        self.assertEqual(vent.active_role(), STANDBY)
+        hardware.fan(PRIMARY).set_fault(False)
+        self.assertTrue(vent.restore_primary().switched)
+        self.assertEqual(vent.active_role(), PRIMARY)
+
+    def test_inactive_fan_fault_does_not_switch(self) -> None:
+        vent = self._service()
+        result = vent.report_fault(STANDBY)
+        self.assertFalse(result.switched)
+        self.assertEqual(vent.active_role(), PRIMARY)
+        self.assertTrue(vent.running())
 
 
 class FireCase(unittest.TestCase):

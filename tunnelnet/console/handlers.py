@@ -437,14 +437,96 @@ def vent_state(server: "Server", request: Request) -> Response:
     return json_response(server.runtime.ventilation.state().as_dict())
 
 
+def vent_events(server: "Server", request: Request) -> Response:
+    vent = server.runtime.ventilation
+    all_entries = [entry.as_dict() for entry in vent.events()]
+    event_name = request.query_field("event")
+    entries = (
+        [entry for entry in all_entries if entry["event"] == event_name]
+        if event_name
+        else all_entries
+    )
+    distinct: list[str] = []
+    for entry in all_entries:
+        if entry["event"] not in distinct:
+            distinct.append(entry["event"])
+    return json_response(
+        {"items": entries, "count": len(entries), "total": vent.event_count(), "events": distinct}
+    )
+
+
+def _vent_payload(vent, result=None) -> dict[str, object]:
+    payload = vent.state().as_dict()
+    if result is not None:
+        payload["switched"] = result.switched
+        payload["result_reason"] = result.reason
+    return payload
+
+
 def vent_toggle(server: "Server", request: Request) -> Response:
-    running = server.runtime.ventilation.toggle()
-    return json_response({"running": running, "status": server.runtime.ventilation.status()})
+    vent = server.runtime.ventilation
+    vent.toggle()
+    record_event(server.runtime, "vent_toggle")
+    return json_response(_vent_payload(vent))
 
 
 def vent_start(server: "Server", request: Request) -> Response:
-    running = server.runtime.ventilation.start()
-    return json_response({"running": running, "status": server.runtime.ventilation.status()})
+    vent = server.runtime.ventilation
+    vent.start()
+    record_event(server.runtime, "vent_start")
+    return json_response(_vent_payload(vent))
+
+
+def vent_stop(server: "Server", request: Request) -> Response:
+    vent = server.runtime.ventilation
+    vent.stop()
+    record_event(server.runtime, "vent_stop")
+    return json_response(_vent_payload(vent))
+
+
+def vent_switch(server: "Server", request: Request) -> Response:
+    vent = server.runtime.ventilation
+    target = request.str_field("role") or "standby"
+    if target not in ("primary", "standby"):
+        raise RequestError(400, "role must be primary or standby")
+    request_id = request.str_field("request_id")
+    result = vent.switch_over(target, request_id=request_id, reason="operator requested switch")
+    record_event(server.runtime, "vent_switch", target)
+    return json_response(_vent_payload(vent, result))
+
+
+def vent_fault(server: "Server", request: Request) -> Response:
+    vent = server.runtime.ventilation
+    role = request.str_field("role")
+    if role not in ("primary", "standby"):
+        raise RequestError(400, "role must be primary or standby")
+    result = vent.report_fault(role, request_id=request.str_field("request_id"))
+    record_event(server.runtime, "vent_fault", role)
+    return json_response(_vent_payload(vent, result))
+
+
+def vent_healthy(server: "Server", request: Request) -> Response:
+    vent = server.runtime.ventilation
+    role = request.str_field("role")
+    if role not in ("primary", "standby"):
+        raise RequestError(400, "role must be primary or standby")
+    result = vent.report_healthy(role, request_id=request.str_field("request_id"))
+    record_event(server.runtime, "vent_healthy", role)
+    return json_response(_vent_payload(vent, result))
+
+
+def vent_restore(server: "Server", request: Request) -> Response:
+    vent = server.runtime.ventilation
+    result = vent.restore_primary(request_id=request.str_field("request_id"))
+    record_event(server.runtime, "vent_restore", "primary")
+    return json_response(_vent_payload(vent, result))
+
+
+def vent_reset_safe(server: "Server", request: Request) -> Response:
+    vent = server.runtime.ventilation
+    result = vent.reset_safe(request_id=request.str_field("request_id"))
+    record_event(server.runtime, "vent_reset_safe")
+    return json_response(_vent_payload(vent, result))
 
 
 def fire_detectors(server: "Server", request: Request) -> Response:

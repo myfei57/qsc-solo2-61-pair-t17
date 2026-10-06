@@ -360,6 +360,7 @@ class ConsoleCase(unittest.TestCase):
     def test_vent_and_fire_routes(self) -> None:
         status, vent = self.call("GET", "/api/vent")
         self.assertTrue(vent["running"])
+        self.assertEqual(vent["active_role"], "primary")
         status, vent = self.call("POST", "/api/vent/toggle")
         self.assertFalse(vent["running"])
         status, vent = self.call("POST", "/api/vent/start")
@@ -409,6 +410,89 @@ class ConsoleCase(unittest.TestCase):
 
         status, body = self.call("POST", "/api/suppression/clear")
         self.assertEqual(body["count"], 0)
+
+    def test_vent_failover_routes(self) -> None:
+        # primary fault -> automatic fail over to standby
+        status, body = self.call("POST", "/api/vent/fault", {"role": "primary"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["mode"], "running")
+        self.assertEqual(body["active_role"], "standby")
+        self.assertTrue(body["switched"])
+        self.assertFalse(body["fans"]["primary"]["running"])
+        self.assertTrue(body["fans"]["standby"]["running"])
+        self.assertFalse(body["dampers"][0]["open"])
+        self.assertTrue(body["dampers"][1]["open"])
+
+        # primary repaired -> non-revertive: stays on standby
+        status, body = self.call("POST", "/api/vent/healthy", {"role": "primary"})
+        self.assertEqual(body["active_role"], "standby")
+
+        # idempotent manual switch using the same request id
+        status, first = self.call(
+            "POST", "/api/vent/switch", {"role": "primary", "request_id": "op-1"}
+        )
+        self.assertTrue(first["switched"])
+        self.assertEqual(first["active_role"], "primary")
+        status, duplicate = self.call(
+            "POST", "/api/vent/switch", {"role": "primary", "request_id": "op-1"}
+        )
+        self.assertFalse(duplicate["switched"])
+        self.assertEqual(duplicate["result_reason"], "duplicate request ignored")
+
+        # invalid role is a client error
+        status, body = self.call("POST", "/api/vent/switch", {"role": "ghost"})
+        self.assertEqual(status, 400)
+
+        # status and the audit trail read the same persisted journal
+        status, events = self.call("GET", "/api/vent/events")
+        names = [item["event"] for item in events["items"]]
+        self.assertIn("vent_fault", names)
+        self.assertIn("vent_switched", names)
+        self.assertEqual(events["total"], events["count"])
+        status, filtered = self.call("GET", "/api/vent/events", query={"event": ["vent_switched"]})
+        self.assertTrue(all(item["event"] == "vent_switched" for item in filtered["items"]))
+        self.assertGreaterEqual(filtered["count"], 2)
+
+        # explicit operator restore is rejected while the primary is faulted
+        status, body = self.call("POST", "/api/vent/fault", {"role": "primary"})
+        status, refused = self.call("POST", "/api/vent/restore")
+        self.assertFalse(refused["switched"])
+        self.assertIn("still faulted", refused["result_reason"])
+        status, body = self.call("POST", "/api/vent/healthy", {"role": "primary"})
+        status, restored = self.call("POST", "/api/vent/restore")
+        self.assertTrue(restored["switched"])
+        self.assertEqual(restored["active_role"], "primary")
+
+    def test_vent_safe_latch_and_reset_routes(self) -> None:
+        # the standby fan cannot start: fail over must settle safe
+        self.server.runtime.vent_hardware.fan("standby").set_fault(True)
+        status, body = self.call("POST", "/api/vent/fault", {"role": "primary"})
+        self.assertEqual(body["mode"], "safe")
+        self.assertTrue(body["safe"])
+        for fan in body["fans"].values():
+            self.assertFalse(fan["running"])
+        for damper in body["dampers"]:
+            self.assertFalse(damper["open"])
+
+        # health check flags the safe latch as critical
+        status, checks = self.call("GET", "/api/health/checks")
+        vent_check = next(check for check in checks["checks"] if check["name"] == "ventilation")
+        self.assertEqual(vent_check["status"], "critical")
+
+        # start is refused while latched
+        status, body = self.call("POST", "/api/vent/start")
+        self.assertFalse(body["running"])
+        self.assertEqual(body["mode"], "safe")
+
+        # reset without a healthy fan is refused
+        status, body = self.call("POST", "/api/vent/reset-safe")
+        self.assertEqual(body["mode"], "safe")
+
+        # repair the standby, then the operator clears the latch
+        self.server.runtime.vent_hardware.fan("standby").set_fault(False)
+        status, body = self.call("POST", "/api/vent/reset-safe")
+        self.assertEqual(body["mode"], "running")
+        self.assertTrue(body["switched"])
 
     def test_patrol_routes(self) -> None:
         status, patrols = self.call("GET", "/api/patrols")
