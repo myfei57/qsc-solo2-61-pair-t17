@@ -89,7 +89,7 @@ from tunnelnet.store import (
     summarize as summarize_store,
 )
 from tunnelnet.store import record as record_module
-from tunnelnet.vent import VentService
+from tunnelnet.vent import PRIMARY, STANDBY, SimulatedBay, VentService, load_events
 
 
 class StoreCase(unittest.TestCase):
@@ -443,16 +443,264 @@ class DrainCase(unittest.TestCase):
 
 
 class VentCase(unittest.TestCase):
-    def test_toggle_and_status(self) -> None:
-        vent = VentService()
-        self.assertTrue(vent.running())
-        self.assertEqual(vent.status(), "running")
-        self.assertFalse(vent.stop())
-        self.assertEqual(vent.status(), "stopped")
-        self.assertTrue(vent.toggle())
-        self.assertTrue(vent.start())
-        self.assertEqual(vent.state().as_dict(), {"running": True, "status": "running"})
-        self.assertIn("ventilation", vent.describe())
+    def _service(self, tmp: str) -> tuple[VentService, SimulatedBay, Store]:
+        store = Store.open(tmp)
+        bay = SimulatedBay()
+        service = VentService(store, bay)
+        return service, bay, store
+
+    def _run(self, service: VentService, bay: SimulatedBay, ticks: int = 20) -> None:
+        for _ in range(ticks):
+            bay.advance(1.0)
+            service.tick()
+
+    def test_start_runs_primary_and_reports_branches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bay, _store = self._service(tmp)
+            self.assertFalse(service.running())
+            self.assertEqual(service.status(), "stopped")
+            self.assertTrue(service.start())
+            self.assertTrue(service.running())
+            state = service.state().as_dict()
+            self.assertEqual(state["active_role"], PRIMARY)
+            self.assertTrue(state["fans"][PRIMARY]["running"])
+            self.assertTrue(state["fans"][PRIMARY]["damper"] == "open")
+            self.assertEqual(state["fans"][STANDBY]["fan"], "stopped")
+            self.assertEqual(state["fans"][STANDBY]["damper"], "closed")
+            self.assertIn("mode=running", service.describe())
+
+    def test_primary_fault_fails_over_to_standby_break_before_make(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bay, store = self._service(tmp)
+            service.start()
+            self.assertEqual(service.state().active_role, PRIMARY)
+
+            # Kill the running primary; one scan observes it, the next scans
+            # carry out the switchover saga.
+            bay.break_fan(PRIMARY)
+            self._run(service, bay, 20)
+
+            state = service.state().as_dict()
+            self.assertTrue(state["running"])
+            self.assertEqual(state["active_role"], STANDBY)
+            # The dead primary is fully isolated.
+            self.assertEqual(state["fans"][PRIMARY]["fan"], "faulted")
+            self.assertEqual(state["fans"][PRIMARY]["damper"], "closed")
+            self.assertEqual(state["fans"][STANDBY]["fan"], "running")
+            self.assertEqual(state["fans"][STANDBY]["damper"], "open")
+
+            # Break-before-make is visible in the audit ordering.
+            events = [(e.event, e.role) for e in load_events(store)]
+            names = [event for event, _role in events]
+            self.assertIn("duty_fault", names)
+            self.assertIn("switchover_begin", names)
+            first_stop = names.index("fan_command", names.index("switchover_begin"))
+            # No new-fan start command may precede the old-fan stop command.
+            starts_to_standby = [
+                index for index, (_e, role) in enumerate(events)
+                if _e == "fan_command" and role == STANDBY
+            ]
+            self.assertTrue(all(index > first_stop for index in starts_to_standby))
+            # The standby damper is only opened after the primary damper closed.
+            close_cmd = [i for i, (e, r) in enumerate(events) if e == "damper_command" and r == PRIMARY]
+            open_cmd = [i for i, (e, r) in enumerate(events) if e == "damper_command" and r == STANDBY]
+            self.assertTrue(close_cmd and open_cmd and max(close_cmd) < min(open_cmd))
+
+    def test_recovery_is_sticky_no_automatic_switchback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bay, _store = self._service(tmp)
+            service.start()
+            bay.break_fan(PRIMARY)
+            self._run(service, bay)
+            self.assertEqual(service.state().active_role, STANDBY)
+
+            # Primary repaired: it must NOT seize duty back automatically, no
+            # matter how long the system keeps running (anti-flapping).
+            bay.heal_fan(PRIMARY)
+            self._run(service, bay, 40)
+            self.assertEqual(service.state().active_role, STANDBY)
+            # Maintenance clears the latched fault; the primary becomes a
+            # healthy hot standby and still does not take over by itself.
+            self.assertTrue(service.reset_fault(PRIMARY))
+            self.assertTrue(service.state().fans[PRIMARY]["healthy"])
+            self._run(service, bay, 20)
+            self.assertEqual(service.state().active_role, STANDBY)
+
+            # An explicit, cooldown-respecting switchback restores the primary.
+            service._state.last_switch_at = -1.0
+            self.assertTrue(service.switchback())
+            self.assertEqual(service.state().active_role, PRIMARY)
+
+    def test_switch_is_idempotent_and_repeated_commands_dedup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bay, _store = self._service(tmp)
+            service.start()
+            self.assertTrue(service.switch_to(STANDBY, command_id="c1"))
+            self.assertEqual(service.state().active_role, STANDBY)
+            # Same command id replayed after completion: no second switch.
+            last_switch = service._state.last_switch_at
+            self.assertTrue(service.switch_to(STANDBY, command_id="c1"))
+            self.assertEqual(service._state.last_switch_at, last_switch)
+            # Switching to the current duty fan is a no-op success.
+            self.assertTrue(service.switch_to(STANDBY))
+
+    def test_planned_switch_failure_rolls_back_to_previous_duty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bay, _store = self._service(tmp)
+            service.start()
+            self.assertEqual(service.state().active_role, PRIMARY)
+            # The standby damper cannot open: the planned switch must undo
+            # itself and leave the primary serving air.
+            bay.break_damper(STANDBY)
+            self.assertFalse(service.switch_to(STANDBY))
+            state = service.state().as_dict()
+            self.assertTrue(state["running"])
+            self.assertEqual(state["active_role"], PRIMARY)
+            self.assertEqual(state["fans"][PRIMARY]["fan"], "running")
+            names = [e.event for e in service.events()]
+            self.assertIn("switchover_rolled_back", names)
+            self.assertNotIn("safe_state", names)
+
+    def test_no_healthy_target_parks_in_safe_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bay, _store = self._service(tmp)
+            service.start()
+            bay.break_fan(PRIMARY)
+            bay.isolate(STANDBY)  # maintenance isolation: no usable standby
+            self._run(service, bay)
+            state = service.state().as_dict()
+            self.assertFalse(state["running"])
+            self.assertEqual(state["mode"], "safe")
+            self.assertEqual(state["safe_reason"], "no_healthy_fan")
+            self.assertEqual(state["fans"][PRIMARY]["fan"], "faulted")
+            self.assertEqual(state["fans"][STANDBY]["fan"], "faulted")
+            self.assertEqual(state["fans"][STANDBY]["fault"], "isolated")
+            # Start is refused until a human resets after repair.
+            self.assertFalse(service.start())
+            bay.heal_fan(STANDBY)  # isolation input clears on its own
+            self._run(service, bay, 2)
+            self.assertTrue(service.state().fans[STANDBY]["healthy"])
+            self.assertFalse(service.start())  # safe latch still held
+            self.assertTrue(service.reset())
+            self.assertTrue(service.start())
+            self.assertEqual(service.state().active_role, STANDBY)
+
+    def test_welded_contactor_on_running_fan_goes_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bay, _store = self._service(tmp)
+            service.start()
+            bay.break_fan(PRIMARY, welded=True)
+            self._run(service, bay, 5)
+            state = service.state().as_dict()
+            self.assertEqual(state["mode"], "safe")
+            self.assertEqual(state["safe_reason"], "contactor_welded")
+            self.assertFalse(state["running"])
+
+    def test_flapping_past_limit_shuts_down_to_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bay, _store = self._service(tmp)
+            service.start()
+            # Marginal contacts: the duty fan drops, the standby is always
+            # healthy, and the repaired fan is reset between cycles. Three
+            # automatic switches inside the window exhaust the allowance; the
+            # fourth trip is a safe shutdown instead of another transfer.
+            duty = PRIMARY
+            for _ in range(3):
+                bay.break_fan(duty)
+                self._run(service, bay, 20)
+                self.assertTrue(service.running())
+                bay.heal_fan(duty)
+                service.reset_fault(duty)
+                duty = STANDBY if duty == PRIMARY else PRIMARY
+
+            bay.break_fan(duty)
+            self._run(service, bay, 20)
+            state = service.state().as_dict()
+            self.assertEqual(state["mode"], "safe")
+            self.assertEqual(state["safe_reason"], "auto_switch_limit")
+            self.assertEqual(state["auto_switch_count"], 3)
+
+    def test_smoke_latches_ventilation_down_until_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bay, _store = self._service(tmp)
+            service.start()
+            self.assertTrue(service.smoke("zone-1"))
+            state = service.state().as_dict()
+            self.assertTrue(state["smoke"])
+            self.assertEqual(state["smoke_zone"], "zone-1")
+            self.assertFalse(state["running"])
+            # Repeated smoke reports are idempotent and start stays refused.
+            self.assertTrue(service.smoke("zone-1"))
+            self.assertFalse(service.start())
+            self.assertTrue(service.clear_smoke())
+            self.assertTrue(service.start())
+            self.assertTrue(service.running())
+
+    def test_state_and_audit_read_the_same_journal_and_survive_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bay, store = self._service(tmp)
+            service.start()
+            bay.break_fan(PRIMARY)
+            self._run(service, bay)
+            self.assertEqual(service.state().active_role, STANDBY)
+            events_before = [e.as_dict() for e in load_events(store)]
+
+            # New process, same disk: snapshot and journal agree, saga is gone.
+            restarted = VentService(store, SimulatedBay())
+            state = restarted.state().as_dict()
+            self.assertEqual(state["active_role"], STANDBY)
+            self.assertEqual(state["mode"], "running")
+            self.assertIsNone(state["switch"])
+            events_after = [e.as_dict() for e in load_events(store)]
+            self.assertEqual(events_before, events_after)
+            self.assertEqual(restarted.events()[-1].event, "switchover_completed")
+
+    def test_thermal_trip_fails_over_and_auto_clears_on_cool_down(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bay, _store = self._service(tmp)
+            service.start()
+            bay.trip_thermal(PRIMARY)
+            self._run(service, bay)
+            self.assertEqual(service.state().active_role, STANDBY)
+            # Thermal input clears (overload relay reset): primary is healthy
+            # standby again, but duty stays sticky on the standby.
+            bay.heal_fan(PRIMARY)
+            self._run(service, bay, 5)
+            self.assertTrue(service.state().fans[PRIMARY]["healthy"])
+            self.assertEqual(service.state().active_role, STANDBY)
+
+    def test_start_prefers_primary_but_fails_over_to_healthy_standby(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bay, _store = self._service(tmp)
+            bay.break_fan(PRIMARY)  # dead before boot
+            self.assertTrue(service.start())
+            state = service.state().as_dict()
+            self.assertTrue(state["running"])
+            self.assertEqual(state["active_role"], STANDBY)
+            names = [event.event for event in service.events()]
+            self.assertIn("startup_failover", names)
+
+    def test_smoke_aborts_an_inflight_switchover(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bay, _store = self._service(tmp)
+            service.start()
+            self.assertTrue(service.switch_to(STANDBY))
+            # Smoke after the switch completed: bank latches down.
+            self.assertTrue(service.smoke("zone-9"))
+            self.assertFalse(service.running())
+            self.assertIsNone(service.state().switch)
+            self.assertEqual(service.state().mode, "smoke")
+            self.assertFalse(service.start())
+            self.assertTrue(service.clear_smoke())
+            self.assertTrue(service.start())
+
+    def test_service_without_store_keeps_an_in_memory_audit_trail(self) -> None:
+        service = VentService(bay=SimulatedBay())
+        self.assertEqual(service.status(), "stopped")
+        self.assertTrue(service.start())
+        self.assertTrue(service.running())
+        self.assertTrue(service.events())
+        self.assertEqual(service.events()[-1].event, "switchover_completed")
 
 
 class FireCase(unittest.TestCase):

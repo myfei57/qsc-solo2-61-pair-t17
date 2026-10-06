@@ -13,7 +13,7 @@ from tunnelnet.ns import Registry as NamespaceRegistry
 from tunnelnet.patrol import PatrolService
 from tunnelnet.quota import QuotaService
 from tunnelnet.store import Store
-from tunnelnet.vent import VentService
+from tunnelnet.vent import SimulatedBay, VentService
 
 DEFAULT_ZONES = ("zone-1", "zone-2", "zone-3")
 DEFAULT_THRESHOLD = 75.0
@@ -33,7 +33,8 @@ class Runtime:
         self.access = AccessService(store, self.cabins)
         self.pump = PumpUnit()
         self.drain = DrainService(self.cabins, self.pump, store)
-        self.ventilation = VentService()
+        self.vent_bay = SimulatedBay()
+        self.ventilation = VentService(store, self.vent_bay)
         self.suppression = SuppressionLog()
         self.dedupe = MarkSet()
         self.fire = FireService(store, self.ventilation, self.suppression, self.dedupe, DEFAULT_ZONES)

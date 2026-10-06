@@ -437,14 +437,101 @@ def vent_state(server: "Server", request: Request) -> Response:
     return json_response(server.runtime.ventilation.state().as_dict())
 
 
+def vent_events(server: "Server", request: Request) -> Response:
+    """Ventilation audit trail; read from the same journal as vent_state."""
+
+    rows = [event.as_dict() for event in server.runtime.ventilation.events()]
+    event = request.query_field("event")
+    if event:
+        rows = [row for row in rows if row["event"] == event]
+    limit = request.int_field("limit", 0)
+    if limit > 0:
+        rows = rows[-limit:]
+    return json_response({"items": rows, "count": len(rows)})
+
+
 def vent_toggle(server: "Server", request: Request) -> Response:
-    running = server.runtime.ventilation.toggle()
-    return json_response({"running": running, "status": server.runtime.ventilation.status()})
+    server.runtime.ventilation.toggle()
+    return json_response(server.runtime.ventilation.state().as_dict())
 
 
 def vent_start(server: "Server", request: Request) -> Response:
-    running = server.runtime.ventilation.start()
-    return json_response({"running": running, "status": server.runtime.ventilation.status()})
+    server.runtime.ventilation.start(request.str_field("command_id", ""))
+    return json_response(server.runtime.ventilation.state().as_dict())
+
+
+def vent_stop(server: "Server", request: Request) -> Response:
+    stopped = server.runtime.ventilation.stop(command_id=request.str_field("command_id", ""))
+    return json_response(server.runtime.ventilation.state().as_dict() | {"stopped": stopped})
+
+
+def vent_switch(server: "Server", request: Request) -> Response:
+    """Planned, compensating switchover to the requested fan role."""
+
+    role = request.str_field("role")
+    if role not in ("primary", "standby"):
+        raise RequestError(400, "role must be primary or standby")
+    ok = server.runtime.ventilation.switch_to(role, request.str_field("command_id", ""))
+    return json_response(server.runtime.ventilation.state().as_dict() | {"switched": ok})
+
+
+def vent_switchback(server: "Server", request: Request) -> Response:
+    ok = server.runtime.ventilation.switchback(request.str_field("command_id", ""))
+    return json_response(server.runtime.ventilation.state().as_dict() | {"switched": ok})
+
+
+def vent_clear_smoke(server: "Server", request: Request) -> Response:
+    ok = server.runtime.ventilation.clear_smoke()
+    return json_response(server.runtime.ventilation.state().as_dict() | {"cleared": ok})
+
+
+def vent_reset(server: "Server", request: Request) -> Response:
+    ok = server.runtime.ventilation.reset()
+    return json_response(server.runtime.ventilation.state().as_dict() | {"reset": ok})
+
+
+def vent_reset_fault(server: "Server", request: Request) -> Response:
+    role = request.str_field("role")
+    if role not in ("primary", "standby"):
+        raise RequestError(400, "role must be primary or standby")
+    ok = server.runtime.ventilation.reset_fault(role)
+    return json_response(server.runtime.ventilation.state().as_dict() | {"reset": ok})
+
+
+def vent_tick(server: "Server", request: Request) -> Response:
+    """Advance the simulated hardware and run one coordinator scan."""
+
+    seconds = request.int_field("seconds", 1)
+    server.runtime.vent_bay.advance(float(seconds))
+    server.runtime.ventilation.tick()
+    return json_response(server.runtime.ventilation.state().as_dict())
+
+
+def vent_inject(server: "Server", request: Request) -> Response:
+    """Fault injection on the simulated fan bay (offline console only)."""
+
+    role = request.str_field("role")
+    if role not in ("primary", "standby"):
+        raise RequestError(400, "role must be primary or standby")
+    fault = request.str_field("fault")
+    bay = server.runtime.vent_bay
+    if fault == "break":
+        bay.break_fan(role, welded=False)
+    elif fault == "welded":
+        bay.break_fan(role, welded=True)
+    elif fault == "thermal":
+        bay.trip_thermal(role)
+    elif fault == "isolate":
+        bay.isolate(role)
+    elif fault == "damper":
+        bay.break_damper(role)
+    elif fault == "heal":
+        bay.heal_fan(role)
+    else:
+        raise RequestError(400, "unknown fault")
+    # The injected condition is observed on the very next scan.
+    server.runtime.ventilation.tick()
+    return json_response(server.runtime.ventilation.state().as_dict())
 
 
 def fire_detectors(server: "Server", request: Request) -> Response:

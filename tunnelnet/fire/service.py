@@ -22,9 +22,13 @@ class DamperStore(Protocol):
 
 
 class VentStopper(Protocol):
-    """Stops the ventilation bank when smoke is confirmed."""
+    """Latches the ventilation bank down when smoke is confirmed.
 
-    def stop(self) -> bool:  # pragma: no cover - structural
+    Accepts the smoke keyword of the ventilation coordinator; a plain
+    ``stop()`` callable keeps working for simpler stand-ins.
+    """
+
+    def stop(self, *, smoke: bool = ..., zone: str = ...) -> bool:  # pragma: no cover - structural
         ...
 
 
@@ -87,10 +91,14 @@ class FireService:
         return self.handle_smoke(self.zone_of_detector(detector_id))
 
     def handle_smoke(self, zone: str) -> bool:
-        """Close the damper and stop ventilation for the reporting zone."""
+        """Close the damper and latch ventilation down for the reporting zone."""
 
         self._dampers.save("damper", zone, DamperState(zone=zone, closed=True).as_dict())
-        self._vent.stop()
+        stop = self._vent.stop
+        try:
+            stop(smoke=True, zone=zone)
+        except TypeError:
+            stop()
         return True
 
     def activate_zones(self, source: str) -> list[str]:

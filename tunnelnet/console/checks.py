@@ -35,10 +35,12 @@ def run_checks(rt: "Runtime") -> list[dict[str, str]]:
         {"name": "drain", "status": "warn" if high else "ok", "detail": f"high pits={high}"}
     )
 
+    vent_mode = rt.ventilation.state().mode
+    vent_status = "ok" if vent_mode == "running" else ("alarm" if vent_mode in ("safe", "smoke") else "warn")
     checks.append(
         {
             "name": "ventilation",
-            "status": "ok" if rt.ventilation.running() else "warn",
+            "status": vent_status,
             "detail": rt.ventilation.status(),
         }
     )

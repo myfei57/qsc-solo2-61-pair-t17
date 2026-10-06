@@ -49,7 +49,7 @@ class ConsoleCase(unittest.TestCase):
         status, health = self.call("GET", "/api/health")
         self.assertEqual(status, 200)
         self.assertEqual(health["status"], "ok")
-        self.assertEqual(health["kinds"], [])
+        self.assertIn("vent", health["kinds"])
 
         status, checks = self.call("GET", "/api/health/checks")
         self.assertEqual(status, 200)
@@ -360,10 +360,31 @@ class ConsoleCase(unittest.TestCase):
     def test_vent_and_fire_routes(self) -> None:
         status, vent = self.call("GET", "/api/vent")
         self.assertTrue(vent["running"])
+        self.assertEqual(vent["active_role"], "primary")
         status, vent = self.call("POST", "/api/vent/toggle")
         self.assertFalse(vent["running"])
         status, vent = self.call("POST", "/api/vent/start")
         self.assertTrue(vent["running"])
+
+        # Primary dies: failover to the standby completes through the console.
+        status, vent = self.call("POST", "/api/vent/inject", {"role": "primary", "fault": "break"})
+        for _ in range(20):
+            status, vent = self.call("POST", "/api/vent/tick", {"seconds": 1})
+        self.assertTrue(vent["running"])
+        self.assertEqual(vent["active_role"], "standby")
+
+        # The audit endpoint reads the same journal as the state endpoint.
+        status, events = self.call("GET", "/api/vent/events")
+        self.assertEqual(status, 200)
+        names = [row["event"] for row in events["items"]]
+        self.assertIn("switchover_completed", names)
+        self.assertEqual(events["items"][-1]["seq"], events["count"])
+
+        # Recovery is sticky: healing the primary does not move duty back.
+        self.call("POST", "/api/vent/inject", {"role": "primary", "fault": "heal"})
+        for _ in range(10):
+            _, vent = self.call("POST", "/api/vent/tick", {"seconds": 1})
+        self.assertEqual(vent["active_role"], "standby")
 
         status, detectors = self.call("GET", "/api/fire/detectors")
         self.assertEqual(detectors["count"], 2)

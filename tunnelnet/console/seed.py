@@ -54,3 +54,6 @@ def seed_defaults(rt: Runtime) -> None:
     rt.cables.sample("cable-1", 47.0)
 
     rt.patrol.rebuild_route()
+
+    # Primary fan serves air at boot; the standby is a healthy hot reserve.
+    rt.ventilation.start()
